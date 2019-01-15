@@ -11,6 +11,7 @@ __revision__ = "$Id: setup.py 603 2010-01-31 00:11:05Z qvasimodo $"
 
 import re
 import os
+import os.path
 import platform
 import string
 import shutil
@@ -19,15 +20,25 @@ import subprocess as sp
 
 from glob import glob
 from shutil import ignore_patterns
-
+from setuptools import dist
 from distutils import log
 from distutils.command.build import build
 from distutils.command.build_clib import build_clib
 from distutils.command.clean import clean
+from setuptools.command.install import install
 from distutils.command.install_lib import install_lib
 from distutils.command.sdist import sdist
 from distutils.core import setup, Extension
 from distutils.errors import DistutilsSetupError
+
+def scanfor_vc_all():
+ fname = "vcvarsall.bat"
+ startDir = "C:\\Program Files (x86)\\Microsoft Visual Studio\\"
+ print("searching for %s" % fname)
+ for dirpath, dirnames, filenames in os.walk(startDir):
+  for f in filenames:
+   if f == fname:
+    return os.path.join(dirpath, f)
 
 def compile_vc(solution_path, config, platform):
     match_vs = re.compile('vs(\d+)comntools$', re.I).match
@@ -35,7 +46,6 @@ def compile_vc(solution_path, config, platform):
         m.group(1, 0) for m in (match_vs(k) for k in os.environ.keys())
         if m is not None
     ]
-
     msbuild = [
         'msbuild',
             '/p:Configuration=%s' % config,
@@ -50,6 +60,15 @@ def compile_vc(solution_path, config, platform):
             return
         except sp.CalledProcessError:
             log.info('compilation with %s failed', var)
+    # Try brute force find the batch file for VS env
+    try:
+        bat = scanfor_vc_all()
+        log.info('Compiling with %s' % bat)
+        sp.check_call(['call', bat, 'x86_amd64' if platform=='x64' else 'x86', '&&'] + msbuild, shell = True)
+        return
+    except sp.CalledProcessError:
+        log.info('compilation failed')
+
     raise DistutilsSetupError(
         'Failed to compile "%s" with any available compiler' % solution_path
     )
@@ -65,7 +84,11 @@ class custom_build(build):
     def run(self):
         log.info('running custom_build')
         if 'windows' in platform.system().lower():
-            bits = 'x64' if sys.maxsize > 2**32 else 'win32'
+            bits = 'win32' # x86 by default
+            # If x64 is specified in command line, change it here
+            for i in sys.argv:
+                if i.find("--plat-name=win-amd64") != -1:
+                     bits = 'x64'
             compile_vc('make/win32/distorm.sln', 'dll', bits)
             self.copy_file('distorm3.dll', 'python/distorm3')
         build.run(self)
@@ -78,7 +101,7 @@ class custom_build_clib(build_clib):
     libraries alongside the python packages, to facilitate the use of ctypes. 
     """
 
-    def finalize_options (self):
+    def finalize_options(self):
         # We want build-clib to default to build-lib as defined by the 
         # "build" command.  This is so the compiled library will be put 
         # in the right place along side the python code.
@@ -124,7 +147,7 @@ class custom_build_clib(build_clib):
         log.info('running custom_build_clib')
         build_clib.run(self)
 
-    def build_libraries (self, libraries):
+    def build_libraries(self, libraries):
         for (lib_name, build_info) in libraries:
             sources = self.get_source_files_for_lib(lib_name, build_info)
             sources = list(sources)
@@ -181,23 +204,32 @@ class custom_clean(clean):
 
         clean.run(self)
 
-
 class custom_sdist(sdist):
     """Customized sdist command"""
     def run(self):
         log.info('running custom_sdist')
         sdist.run(self)
 
+class BinaryDistribution(dist.Distribution):
+    def is_pure(self):
+        return False
+    def has_ext_modules(self):
+        return True
+
+class custom_install(install):
+    def finalize_options(self):
+        install.finalize_options(self)
+        self.install_lib = self.install_platlib
 
 def main():
     # Just in case we are being called from a different directory
     cwd = os.path.dirname(__file__)
     if cwd:
         os.chdir(cwd)
-    
+
     # Get the target platform
     system  = platform.system().lower()
-    
+
     # Setup the extension module
     # Setup the library
     ext_modules = None
@@ -211,8 +243,8 @@ def main():
             package='distorm3',
             sources=get_sources,
             include_dirs=['src', 'include'],
-            extra_compile_args=['-arch', 'i386', '-arch', 'x86_64', '-O2', 
-                                '-Wall', '-fPIC', '-DSUPPORT_64BIT_OFFSET', 
+            extra_compile_args=['-arch', 'i386', '-arch', 'x86_64', '-O2',
+                                '-Wall', '-fPIC', '-DSUPPORT_64BIT_OFFSET',
                                 '-DDISTORM_DYNAMIC']))]
     elif 'cygwin' in system:
         libraries = [(
@@ -220,8 +252,8 @@ def main():
             package='distorm3',
             sources=get_sources,
             include_dirs=['src', 'include'],
-            extra_compile_args=['-fPIC', '-O2', '-Wall', 
-                                '-DSUPPORT_64BIT_OFFSET', 
+            extra_compile_args=['-fPIC', '-O2', '-Wall',
+                                '-DSUPPORT_64BIT_OFFSET',
                                 '-DDISTORM_STATIC']))]
     else:
         libraries = [(
@@ -229,10 +261,11 @@ def main():
             package='distorm3',
             sources=get_sources,
             include_dirs=['src', 'include'],
-            extra_compile_args=['-fPIC', '-O2', '-Wall', 
-                                '-DSUPPORT_64BIT_OFFSET', 
+            extra_link_args=['-Wl,-soname,libdistorm3.so.3'],
+            extra_compile_args=['-fPIC', '-O2', '-Wall',
+                                '-DSUPPORT_64BIT_OFFSET',
                                 '-DDISTORM_STATIC']))]
-    
+
     options = {
 
     # Setup instructions
@@ -243,13 +276,15 @@ def main():
     'cmdclass'          : { 'build' : custom_build,
                             'build_clib' : custom_build_clib,
                             'clean' : custom_clean, 
-                            'sdist' : custom_sdist },
+                            'sdist' : custom_sdist,
+                            'install' : custom_install },
     'libraries'         : libraries,
     'package_data'      : {'distorm3': package_data},
+    'distclass'         : BinaryDistribution,
 
     # Metadata
     'name'              : 'distorm3',
-    'version'           : '3.3.4',
+    'version'           : '3.4.1',
     'description'       : 'The goal of diStorm3 is to decode x86/AMD64' \
                           ' binary streams and return a structure that' \
                           ' describes each instruction.',
@@ -260,9 +295,9 @@ def main():
                         'Python bindings by Mario Vilas (mvilas@gmail.com)'
                         ),
     'author'            : 'Gil Dabah',
-    'author_email'      : 'distorm'+chr(64)+'gmail'+chr(0x2e)+'com',
+    'author_email'      : 'distorm@gmail.com',
     'maintainer'        : 'Gil Dabah',
-    'maintainer_email'  : 'distorm'+chr(64)+'gmail'+chr(0x2e)+'com',
+    'maintainer_email'  : 'distorm@gmail.com',
     'url'               : 'https://github.com/gdabah/distorm/',
     'download_url'      : 'https://github.com/gdabah/distorm/',
     'platforms'         : ['cygwin', 'win', 'linux', 'macosx'],
